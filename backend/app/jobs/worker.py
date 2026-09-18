@@ -21,13 +21,17 @@ class JobWorker:
         jobs: JobService,
         repository: Repository,
         worker_id: str,
+        migration: Any | None = None,
         handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] | None = None,
     ) -> None:
         self.jobs = jobs
         self.repository = repository
         self.worker_id = worker_id
+        self.migration = migration
         self.handlers = {
             "integrity_scan": self._integrity_scan,
+            "migration.verify_batch": self._migration_verify_batch,
+            "migration.apply_batch": self._migration_apply_batch,
             **(handlers or {}),
         }
 
@@ -77,4 +81,35 @@ class JobWorker:
             "problem_count": len(problems),
             "problems": problems[:200],
             "state_revision": state["revision"],
+        }
+
+    def _require_migration(self) -> Any:
+        if self.migration is None:
+            from ..migration import MigrationService
+
+            self.migration = MigrationService(self.repository)
+        return self.migration
+
+    def _migration_verify_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        migration = self._require_migration()
+        actor = str(payload.get("actor_id") or "migration-worker")
+        batch = migration.verify_batch(
+            str(payload["plan_id"]),
+            int(payload["seq"]),
+            actor_id=actor,
+        )
+        return {"batch": batch["seq"], "status": batch["status"]}
+
+    def _migration_apply_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        migration = self._require_migration()
+        actor = str(payload.get("actor_id") or "migration-worker")
+        batch = migration.apply_batch(
+            str(payload["plan_id"]),
+            int(payload["seq"]),
+            actor_id=actor,
+        )
+        return {
+            "batch": batch["seq"],
+            "status": batch["status"],
+            "applied": batch["applied_objects"],
         }

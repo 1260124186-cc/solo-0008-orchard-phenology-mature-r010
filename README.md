@@ -13,6 +13,9 @@
 - 季节物候：按固定阶段顺序记录日期、置信度和说明，完成后冻结。
 - 品种比较：只对两份同年已完成季节志的共同阶段计算日期偏移。
 - 编研简报：冻结已确认园区在生成时点的植株与季节志摘要，并下载文本。
+- 领域迁移：新的阶段定义、字段精度与引用结构以“双读验证 + 按对象分批 +
+  可暂停/回滚”的方式安全切换，期间新旧写入产生同一业务结论，并同时核对
+  业务结果、版本血缘、审计和 outbox。详见 `backend/app/migration/README.md`。
 
 ## 技术结构
 
@@ -131,6 +134,17 @@ python3 scripts/generate_dataset.py \
 
 生成器会直接建立与业务域一致的园区、植株、完成季节志和比较记录，用于查询、迁移、压缩和并发实验。
 
+领域规则与数据结构的安全迁移可通过命令行在生产式负载下推进（先双读验证、
+按批切换、遇不兼容即停）：
+
+```bash
+python3 scripts/migrate_domain.py --data-dir backend/var plan --batch-size 50 \
+    --name "阶段字典与置信度精度 v2"
+python3 scripts/migrate_domain.py --data-dir backend/var advance PLAN_ID
+python3 scripts/migrate_domain.py --data-dir backend/var report PLAN_ID
+python3 scripts/migrate_domain.py --data-dir backend/var finalize PLAN_ID
+```
+
 三条检查都启动真实后端与真实 Vue 页面，通过浏览器完成关键步骤，再从 API 核对结果：
 
 ```bash
@@ -175,6 +189,8 @@ node scripts/workflow_check.mjs --workflow compare
 - `GET|PUT /api/comparisons`：查询或生成对比图谱。
 - `GET /api/briefs` 与 `GET /api/briefs/{brief_id}`：查询编研简报。
 - `PUT /api/plots/{plot_id}/briefs`：生成冻结简报。
+- `/api/migration/...`：领域迁移计划、批次验证/切换、不兼容集合、四切面核对
+  报告、更正与合并（`migration:read` / `migration:admin` 能力）。
 
 ## 数据与一致性
 

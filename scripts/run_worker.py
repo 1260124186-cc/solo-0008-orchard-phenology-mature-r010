@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app.jobs import JobService, JobWorker  # noqa: E402
+from app.migration import MigrationService  # noqa: E402
 from app.persistence import Database, Repository  # noqa: E402
 
 
@@ -35,10 +36,12 @@ def main() -> int:
         legacy_state_path=data_dir / "state.json",
     )
     repository.open()
+    migration = MigrationService(repository)
     worker = JobWorker(
         jobs=JobService(repository.database),
         repository=repository,
         worker_id=args.worker_id,
+        migration=migration,
     )
     if args.once:
         return 0 if worker.run_once() else 1

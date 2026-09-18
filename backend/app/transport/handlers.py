@@ -10,7 +10,7 @@ from ..application import (
     ComparisonService,
     ObservationService,
 )
-from ..domain.stages import STAGES
+from ..domain.stages import active_stages
 from ..errors import ValidationError
 from ..jobs import JobService
 from ..persistence import Repository
@@ -38,10 +38,14 @@ class ApiHandlers:
         self.identity = identity
 
     def health(self) -> dict[str, Any]:
+        from ..migration.runtime import RUNTIME
+
         return {
             "status": "ok",
             "service": "orchard-phenology-atlas",
-            "schema_version": 2,
+            "schema_version": 3,
+            "domain_generation": RUNTIME.generation,
+            "active_migration_plan": RUNTIME.active_plan_id,
         }
 
     def stage_catalog(self) -> dict[str, Any]:
@@ -53,7 +57,7 @@ class ApiHandlers:
                     "rank": stage.rank,
                     "required_for_completion": stage.required_for_completion,
                 }
-                for stage in STAGES
+                for stage in active_stages()
             ]
         }
 

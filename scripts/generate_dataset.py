@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -138,7 +139,11 @@ def main() -> int:
                 continue
             left_payload = json.loads(left_row["payload"])
             right_payload = json.loads(right_row["payload"])
-            offsets, summary = _comparison_values(left_payload, right_payload)
+            left_tree = _fetch_tree(connection, left_payload["tree_id"])
+            right_tree = _fetch_tree(connection, right_payload["tree_id"])
+            offsets, summary = _comparison_values(
+                left_payload, right_payload, left_tree, right_tree
+            )
             comparison_id = f"atlas_bench_{comparison_index:06d}"
             _upsert(
                 connection,
@@ -153,8 +158,8 @@ def main() -> int:
                     "right_observation_id": right,
                     "left_tree_id": left_payload["tree_id"],
                     "right_tree_id": right_payload["tree_id"],
-                    "left_label": left_payload["tree_id"],
-                    "right_label": right_payload["tree_id"],
+                    "left_label": _tree_label(left_tree),
+                    "right_label": _tree_label(right_tree),
                     "stage_offsets": offsets,
                     "summary": summary,
                     "created_at": timestamp,
@@ -263,53 +268,45 @@ def _upsert(
     )
 
 
+def _fetch_tree(
+    connection: sqlite3.Connection,
+    tree_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT payload FROM entities WHERE kind = 'tree' AND id = ?",
+        (tree_id,),
+    ).fetchone()
+    return json.loads(row["payload"]) if row is not None else None
+
+
+def _tree_label(tree: dict[str, Any] | None) -> str:
+    if tree is None:
+        return "已移除植株"
+    return f"{tree['code']} · {tree['cultivar']}"
+
+
 def _comparison_values(
     left: dict[str, Any],
     right: dict[str, Any],
+    left_tree: dict[str, Any] | None,
+    right_tree: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    left_entries = {item["stage"]: item for item in left["entries"]}
-    right_entries = {item["stage"]: item for item in right["entries"]}
-    ranks = {
-        "bud_burst": 20,
-        "full_bloom": 40,
-        "fruit_set": 60,
-        "harvest": 80,
-    }
-    labels = {
-        "bud_burst": "萌芽期",
-        "full_bloom": "盛花期",
-        "fruit_set": "坐果期",
-        "harvest": "采收期",
-    }
-    offsets = []
-    for stage in sorted(set(left_entries) & set(right_entries), key=ranks.get):
-        left_date = date.fromisoformat(left_entries[stage]["observed_on"])
-        right_date = date.fromisoformat(right_entries[stage]["observed_on"])
-        offsets.append(
-            {
-                "stage": stage,
-                "label": labels[stage],
-                "rank": ranks[stage],
-                "left_date": left_date.isoformat(),
-                "right_date": right_date.isoformat(),
-                "offset_days": (right_date - left_date).days,
-                "confidence_gap": 0,
-            }
-        )
-    values = [item["offset_days"] for item in offsets]
-    average = sum(values) / len(values) if values else 0
-    return offsets, {
-        "title": "规模比较",
-        "common_stage_count": len(offsets),
-        "average_offset_days": round(average, 1),
-        "minimum_offset_days": min(values) if values else 0,
-        "maximum_offset_days": max(values) if values else 0,
-        "earliest_stage": offsets[0]["label"] if offsets else "",
-        "latest_stage": offsets[-1]["label"] if offsets else "",
-        "direction": "规模数据",
-        "stability": "规模数据",
-        "sentence": "规模数据比较结果。",
-    }
+    """与业务域完全一致地计算偏移与摘要，避免规模数据违反领域规则。"""
+    from app.domain.comparison_rules import (
+        build_summary,
+        calculate_stage_offsets,
+    )
+
+    offsets = calculate_stage_offsets(left, right)
+    summary = build_summary(
+        "规模比较",
+        left,
+        right,
+        left_tree,
+        right_tree,
+        offsets,
+    )
+    return offsets, summary
 
 
 if __name__ == "__main__":

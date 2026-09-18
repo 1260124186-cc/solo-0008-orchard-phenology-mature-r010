@@ -109,6 +109,87 @@ class HttpFoundationTests(unittest.TestCase):
         self.assertEqual(job_status, 200)
         self.assertEqual(job["status"], "queued")
 
+    def test_http_migration_plan_lifecycle_and_capability(self) -> None:
+        admin = {"X-Actor-Id": "local-admin"}
+        observer = {"X-Actor-Id": "local-observer"}
+
+        # 普通观察者没有迁移管理能力。
+        status, payload = self._request("GET", "/migration/status", headers=observer)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "forbidden")
+
+        # 观察者至少需要迁移读能力；这里直接验证管理员路径。
+        status, status_payload = self._request(
+            "GET", "/migration/status", headers=admin
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(status_payload["generation"], 1)
+
+        # 准备一个最小园区。
+        plot_body = {
+            "code": "OR-8202",
+            "name": "迁移园区",
+            "locality": "地",
+            "cultivar_focus": "品种",
+            "steward": "组",
+            "planting_year": 2010,
+            "note": "",
+        }
+        plot_status, plot = self._request("PUT", "/plots", plot_body, admin)
+        self.assertEqual(plot_status, 200)
+
+        status, plan = self._request(
+            "PUT",
+            "/migration/plans",
+            {"name": "HTTP 迁移", "batch_size": 10},
+            admin,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(plan["status"], "active")
+        plan_id = plan["id"]
+
+        status, detail = self._request(
+            "GET", f"/migration/plans/{plan_id}", headers=admin
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(detail["batches"])
+        seq = detail["batches"][0]["seq"]
+
+        status, verified = self._request(
+            "PUT",
+            f"/migration/plans/{plan_id}/batches/{seq}/verify",
+            {},
+            admin,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(verified["status"], "verified")
+
+        status, applied = self._request(
+            "PUT",
+            f"/migration/plans/{plan_id}/batches/{seq}/apply",
+            {},
+            admin,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(applied["status"], "applied")
+
+        status, report = self._request(
+            "GET", f"/migration/plans/{plan_id}/report", headers=admin
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(report["business_result_parity"]["ok"])
+        self.assertTrue(report["version_lineage"]["ok"])
+        self.assertTrue(report["audit_outbox_parity"]["ok"])
+
+        status, finalized = self._request(
+            "PUT", f"/migration/plans/{plan_id}/finalize", {}, admin
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(finalized["status"], "finalized")
+
+        status, health = self._request("GET", "/health", headers=admin)
+        self.assertEqual(health["domain_generation"], 2)
+
     def _request(
         self,
         method: str,

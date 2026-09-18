@@ -19,6 +19,7 @@ from ..application import (
 from ..config import RuntimeConfig
 from ..errors import DomainError
 from ..jobs import JobService
+from ..migration import MigrationService
 from ..persistence import Repository
 from ..persistence.repository import request_fingerprint
 from ..security import (
@@ -28,6 +29,7 @@ from ..security import (
     request_scope,
 )
 from .handlers import ApiHandlers, build_router
+from .migration_handlers import MigrationHandlers, build_migration_router
 from .router import Handler, Router
 
 
@@ -225,6 +227,7 @@ def create_server(
     briefs = BriefService(repository)
     jobs = JobService(repository.database)
     identity = IdentityService(repository.database)
+    migrations = MigrationService(repository)
     handlers = ApiHandlers(
         catalog,
         observations,
@@ -235,6 +238,8 @@ def create_server(
         identity,
     )
     router = build_router(handlers)
+    for route in build_migration_router(MigrationHandlers(migrations)).routes:
+        router._routes.append(route)
     authorization = AuthorizationService(repository.database)
     return AtlasHTTPServer(
         (config.host, config.port),

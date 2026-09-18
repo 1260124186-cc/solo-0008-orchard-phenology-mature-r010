@@ -40,6 +40,8 @@ class Repository:
     ) -> None:
         self.database = database
         self.legacy_state_path = legacy_state_path
+        # 由 MigrationService 在装配时注入；未启用迁移时为 None。
+        self.migration_hook: Callable[..., None] | None = None
 
     def open(self) -> None:
         self.database.initialize()
@@ -85,6 +87,18 @@ class Repository:
             if changes:
                 next_revision = int(baseline["revision"]) + 1
                 working["revision"] = next_revision
+                # 双写钩子在同一事务内、业务落库前运行：
+                # - 影子期：把每个变更投影到新世代并校验业务结论一致；
+                # - 已切换期：就地把载荷升级为新世代，使本次写入按新规则落库。
+                # 若新规则无法保持同一业务结论，这里抛错会让整笔业务写入连同
+                # 实体、审计、outbox 一起回滚。
+                if self.migration_hook is not None:
+                    self.migration_hook(
+                        connection,
+                        changes=changes,
+                        state=working,
+                        next_revision=next_revision,
+                    )
                 _persist_changes(
                     connection,
                     changes,

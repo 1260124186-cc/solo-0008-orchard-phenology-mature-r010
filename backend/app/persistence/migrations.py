@@ -162,6 +162,112 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        3,
+        "staged domain migration ledger and projections",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS migration_plans (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                from_generation INTEGER NOT NULL,
+                to_generation INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('active', 'paused', 'finalized', 'rolled_back')
+                ),
+                batch_size INTEGER NOT NULL,
+                total_objects INTEGER NOT NULL DEFAULT 0,
+                applied_objects INTEGER NOT NULL DEFAULT 0,
+                incompatible_objects INTEGER NOT NULL DEFAULT 0,
+                rationale TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finalized_at TEXT,
+                rolled_back_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS migration_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id TEXT NOT NULL REFERENCES migration_plans(id),
+                seq INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'pending', 'verifying', 'verified', 'applying',
+                        'applied', 'failed', 'rolled_back'
+                    )
+                ),
+                expected_objects INTEGER NOT NULL DEFAULT 0,
+                applied_objects INTEGER NOT NULL DEFAULT 0,
+                incompatible_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint TEXT,
+                report TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT,
+                UNIQUE (plan_id, seq)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS migration_objects (
+                plan_id TEXT NOT NULL REFERENCES migration_plans(id),
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                batch_seq INTEGER,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'registered', 'verified', 'incompatible',
+                        'applied', 'rolled_back', 'skipped'
+                    )
+                ),
+                source_revision INTEGER,
+                legacy_payload TEXT,
+                projected_payload TEXT,
+                v1_fingerprint TEXT,
+                v2_fingerprint TEXT,
+                reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (plan_id, kind, object_id)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS migration_objects_batch_idx
+            ON migration_objects (plan_id, batch_seq, status)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS migration_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id TEXT NOT NULL REFERENCES migration_plans(id),
+                op_type TEXT NOT NULL CHECK (
+                    op_type IN ('correction', 'merge', 'note')
+                ),
+                target_kind TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                payload TEXT NOT NULL CHECK (json_valid(payload)),
+                status TEXT NOT NULL CHECK (
+                    status IN ('requested', 'applied', 'reverted')
+                ),
+                applied_batch_seq INTEGER,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS entity_projections (
+                plan_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                payload TEXT NOT NULL CHECK (json_valid(payload)),
+                fingerprint TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (plan_id, kind, object_id)
+            )
+            """,
+        ),
+    ),
 )
 
 
@@ -201,6 +307,8 @@ def migrate(database: "Database") -> None:
                 )
                 if migration.version == 2:
                     _seed_actors(connection)
+                if migration.version == 3:
+                    _seed_migration_grant(connection)
                 connection.execute("COMMIT")
             except Exception as exc:
                 connection.execute("ROLLBACK")
@@ -256,6 +364,40 @@ def _seed_actors(connection: object) -> None:
             "local-observer",
             "plot:read",
             "plot",
+            "*",
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO access_grants
+        (id, actor_id, capability, resource_kind, resource_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "grant_local_admin_migration",
+            "local-admin",
+            "migration:admin",
+            "migration",
+            "*",
+            timestamp,
+        ),
+    )
+
+
+def _seed_migration_grant(connection: object) -> None:
+    timestamp = _now()
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO access_grants
+        (id, actor_id, capability, resource_kind, resource_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "grant_local_admin_migration",
+            "local-admin",
+            "migration:admin",
+            "migration",
             "*",
             timestamp,
         ),

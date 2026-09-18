@@ -8,7 +8,7 @@ from typing import Any
 
 from ..errors import PreconditionError, ValidationError
 from .plot_rules import new_identifier, now_iso
-from .stages import STAGE_BY_KEY, sort_stage_entries
+from .stages import STAGE_BY_KEY, sort_stage_entries, stage_label
 
 
 def create_comparison_record(
@@ -78,7 +78,7 @@ def calculate_stage_offsets(
         item["stage"]: item for item in sort_stage_entries(right.get("entries", []))
     }
     common = set(left_entries) & set(right_entries)
-    ordered_common = sorted(common, key=lambda key: STAGE_BY_KEY[key].rank)
+    ordered_common = sorted(common, key=_rank_of)
     result: list[dict[str, Any]] = []
     for key in ordered_common:
         left_entry = left_entries[key]
@@ -89,8 +89,8 @@ def calculate_stage_offsets(
         result.append(
             {
                 "stage": key,
-                "label": STAGE_BY_KEY[key].label,
-                "rank": STAGE_BY_KEY[key].rank,
+                "label": stage_label(key),
+                "rank": _rank_of(key),
                 "left_date": left_date.isoformat(),
                 "right_date": right_date.isoformat(),
                 "offset_days": offset,
@@ -100,6 +100,13 @@ def calculate_stage_offsets(
             }
         )
     return result
+
+
+def _rank_of(key: str) -> int:
+    from .stages import stage_rank
+
+    rank = stage_rank(key)
+    return rank if rank is not None else 10 ** 9
 
 
 def build_summary(

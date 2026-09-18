@@ -31,8 +31,65 @@ STAGES: tuple[StageDefinition, ...] = (
 STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
 
 
+def active_stages() -> tuple[StageDefinition, ...]:
+    """返回当前生效世代的阶段字典（第 2 代新增休眠期）。"""
+    from ..migration.runtime import RUNTIME
+
+    if RUNTIME.generation >= 2:
+        from ..migration.contracts.stages_v2 import V2_STAGES
+
+        return tuple(
+            StageDefinition(
+                item.key,
+                item.label,
+                item.rank,
+                item.required_for_completion,
+            )
+            for item in V2_STAGES
+        )
+    return STAGES
+
+
+def stage_rank(key: str) -> int | None:
+    from ..migration.runtime import RUNTIME
+
+    if RUNTIME.generation >= 2:
+        from ..migration.contracts.stages_v2 import V2_STAGE_BY_KEY
+
+        definition = V2_STAGE_BY_KEY.get(key)
+        return definition.rank if definition else None
+    definition = STAGE_BY_KEY.get(key)
+    return definition.rank if definition else None
+
+
+def stage_label(key: str) -> str:
+    from ..migration.runtime import RUNTIME
+
+    label = RUNTIME.stage_label(key)
+    if label is not None:
+        return label
+    return key
+
+
 def stage_definition(key: str) -> StageDefinition:
     normalized = str(key or "").strip().lower()
+    from ..migration.runtime import RUNTIME
+
+    if RUNTIME.generation >= 2:
+        from ..migration.contracts.stages_v2 import (
+            V2_STAGE_BY_KEY,
+            v2_stage_definition,
+        )
+
+        if normalized in V2_STAGE_BY_KEY:
+            definition = V2_STAGE_BY_KEY[normalized]
+            return StageDefinition(
+                definition.key,
+                definition.label,
+                definition.rank,
+                definition.required_for_completion,
+            )
+        return v2_stage_definition(normalized)  # 抛出带 v2 字典的校验错误
     try:
         return STAGE_BY_KEY[normalized]
     except KeyError as exc:
@@ -47,15 +104,15 @@ def sort_stage_entries(entries: Iterable[dict[str, object]]) -> list[dict[str, o
     return sorted(
         entries,
         key=lambda item: (
-            STAGE_BY_KEY.get(str(item.get("stage")), STAGES[-1]).rank,
+            stage_rank(str(item.get("stage"))) or 10 ** 9,
             str(item.get("observed_on", "")),
         ),
     )
 
 
 def required_stage_keys() -> set[str]:
-    return {stage.key for stage in STAGES if stage.required_for_completion}
+    return {stage.key for stage in active_stages() if stage.required_for_completion}
 
 
 def stage_labels() -> dict[str, str]:
-    return {stage.key: stage.label for stage in STAGES}
+    return {stage.key: stage.label for stage in active_stages()}
