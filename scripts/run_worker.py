@@ -35,6 +35,13 @@ def main() -> int:
         legacy_state_path=data_dir / "state.json",
     )
     repository.open()
+
+    from app.migration.live_guard import LiveWriteGuard
+    from app.migration.recovery import MigrationRecovery
+
+    repository.live_write_guard = LiveWriteGuard(repository)
+    MigrationRecovery(repository).recover()
+
     worker = JobWorker(
         jobs=JobService(repository.database),
         repository=repository,

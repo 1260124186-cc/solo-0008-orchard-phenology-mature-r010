@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from .database import Database
 from .snapshot import check_relationships, empty_state, ensure_state_shape
 
 
+LOGGER = logging.getLogger("orchard-phenology-atlas")
 T = TypeVar("T")
 
 ENTITY_KINDS: dict[str, str] = {
@@ -40,6 +42,8 @@ class Repository:
     ) -> None:
         self.database = database
         self.legacy_state_path = legacy_state_path
+        # 迁移期间注入的实时双写护栏；为 None 时表示没有进行中的迁移。
+        self.live_write_guard: Any = None
 
     def open(self) -> None:
         self.database.initialize()
@@ -61,7 +65,38 @@ class Repository:
             return _load_state(connection)
 
     def atomic_update(self, action: Callable[[dict[str, Any]], T]) -> T:
+        return self._atomic_update(action, migration_meta=None)
+
+    def atomic_update_migration(
+        self,
+        action: Callable[[dict[str, Any]], T],
+        *,
+        reason: str,
+        run_id: str,
+        kind: str,
+        object_id: str,
+    ) -> T:
+        """迁移驱动的写入：同样在单一事务内提交实体、版本、审计与 outbox，
+        但审计动作和 outbox 载荷带迁移标记，便于四维校验区分。"""
+
+        return self._atomic_update(
+            action,
+            migration_meta={
+                "reason": reason,
+                "run_id": run_id,
+                "kind": kind,
+                "object_id": object_id,
+            },
+        )
+
+    def _atomic_update(
+        self,
+        action: Callable[[dict[str, Any]], T],
+        *,
+        migration_meta: dict[str, Any] | None,
+    ) -> T:
         context = current_request_context()
+        guard = self.live_write_guard
         with self.database.transaction(immediate=True) as connection:
             if context.idempotency_key:
                 existing = _read_idempotent_result(connection, context)
@@ -82,6 +117,16 @@ class Repository:
                 )
 
             changes = _changed_entities(baseline, working)
+            # 迁移期间：提交前强制新旧规则业务结论一致，否则整体回滚。
+            # 迁移自身有意写入的 v2-only 事实（合并/切换/保留）通过
+            # allow_new_rule_facts 豁免往返检查，但仍要求双读业务指纹等价。
+            if guard is not None and changes:
+                guard.verify(
+                    connection,
+                    working,
+                    changes,
+                    allow_new_rule_facts=migration_meta is not None,
+                )
             if changes:
                 next_revision = int(baseline["revision"]) + 1
                 working["revision"] = next_revision
@@ -89,15 +134,37 @@ class Repository:
                     connection,
                     changes,
                     actor_id=context.actor_id or "anonymous",
-                    action=_action_name(context),
+                    action=_action_name(context, migration_meta),
                     next_revision=next_revision,
                     context=context,
+                    migration_meta=migration_meta,
                 )
                 _set_meta(connection, "state_revision", str(next_revision))
 
             if context.idempotency_key:
                 _store_idempotent_result(connection, context, result)
+
+        # 事务提交后再刷新双读影子台账；失败不回滚已提交业务，由恢复对账兜底。
+        if guard is not None and changes:
+            run_id = _active_migration_run_id(connection=None, database=self.database)
+            if run_id is not None:
+                reference_map = _read_reference_map(self.database, run_id)
+                shadow_actor = (
+                    f"migration://{migration_meta['reason']}"
+                    if migration_meta is not None
+                    else (context.actor_id or "anonymous")
+                )
+                try:
+                    guard.refresh_shadow(
+                        changes,
+                        run_id=run_id,
+                        reference_map=reference_map,
+                        actor_id=shadow_actor,
+                    )
+                except Exception:  # pragma: no cover - 影子刷新不影响业务提交
+                    LOGGER.exception("迁移双读影子刷新失败，等待启动恢复对账")
             return copy.deepcopy(result)
+        return copy.deepcopy(result)
 
     def stats(self) -> dict[str, int]:
         with self.database.read_connection() as connection:
@@ -401,6 +468,7 @@ def _persist_changes(
     action: str,
     next_revision: int,
     context: Any,
+    migration_meta: dict[str, Any] | None = None,
 ) -> None:
     timestamp = _now()
     for kind, identifier, payload, operation in changes:
@@ -429,6 +497,11 @@ def _persist_changes(
             details={
                 "operation": operation,
                 "route": getattr(context, "route_template", ""),
+                **(
+                    {"migration": migration_meta}
+                    if migration_meta is not None
+                    else {}
+                ),
             },
             context=context,
         )
@@ -441,6 +514,14 @@ def _persist_changes(
                 "operation": operation,
                 "revision": int(payload.get("revision") or next_revision),
                 "actor_id": actor_id,
+                **(
+                    {
+                        "reason": migration_meta["reason"],
+                        "run_id": migration_meta["run_id"],
+                    }
+                    if migration_meta is not None
+                    else {}
+                ),
             },
         )
 
@@ -639,7 +720,9 @@ def _canonical(value: Any) -> str:
     )
 
 
-def _action_name(context: Any) -> str:
+def _action_name(context: Any, migration_meta: dict[str, Any] | None = None) -> str:
+    if migration_meta is not None:
+        return f"migration.{migration_meta['reason']}"
     template = str(getattr(context, "route_template", "") or "")
     method = str(getattr(context, "request_method", "") or "write").lower()
     if template.endswith("/confirm"):
@@ -677,6 +760,44 @@ def request_fingerprint(
         }
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _active_migration_run_id(
+    connection: sqlite3.Connection | None,
+    *,
+    database: "Database | None" = None,
+) -> str | None:
+    """返回处于活动状态的迁移 run_id；表尚不存在或无活动时返回 None。"""
+
+    sql = (
+        "SELECT run_id FROM migration_runs "
+        "WHERE status IN ('shadow', 'running', 'paused', 'blocked', 'rolling_back') "
+        "ORDER BY created_at DESC LIMIT 1"
+    )
+    try:
+        if connection is not None:
+            row = connection.execute(sql).fetchone()
+        else:
+            assert database is not None
+            with database.read_connection() as read_connection:
+                row = read_connection.execute(sql).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return str(row["run_id"]) if row is not None else None
+
+
+def _read_reference_map(database: "Database", run_id: str) -> dict[str, str]:
+    with database.read_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (f"migration.{run_id}.reference_map",),
+        ).fetchone()
+    if row is None:
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in json.loads(row["value"]).items()
+    }
 
 
 def _outbox_view(row: sqlite3.Row) -> dict[str, Any]:

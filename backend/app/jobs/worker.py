@@ -30,6 +30,10 @@ class JobWorker:
             "integrity_scan": self._integrity_scan,
             **(handlers or {}),
         }
+        # 迁移批次作为普通后台任务注册，复用租约、重试与死信。
+        from ..migration.jobs import register_migration_handlers
+
+        register_migration_handlers(self, repository)
 
     def run_once(self) -> bool:
         job = self.jobs.claim(worker_id=self.worker_id, lease_seconds=60)

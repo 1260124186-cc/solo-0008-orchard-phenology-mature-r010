@@ -225,6 +225,14 @@ def create_server(
     briefs = BriefService(repository)
     jobs = JobService(repository.database)
     identity = IdentityService(repository.database)
+
+    # 安装实时双写护栏并执行启动恢复；无活动迁移时两者均为低开销空操作。
+    from ..migration.live_guard import LiveWriteGuard
+    from ..migration.recovery import MigrationRecovery
+
+    repository.live_write_guard = LiveWriteGuard(repository)
+    MigrationRecovery(repository).recover()
+
     handlers = ApiHandlers(
         catalog,
         observations,

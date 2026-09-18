@@ -338,6 +338,223 @@ class ApiHandlers:
     def revoke_grant(self, *, params: dict[str, str]) -> dict[str, Any]:
         return self.identity.revoke(params["grant_id"])
 
+    # ------------------------------------------------------------------
+    # 安全迁移
+    # ------------------------------------------------------------------
+    def migration_overview(self) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        service = MigrationService(self.repository)
+        run = service.ledger.active_run()
+        return {
+            "active_run": service.status(run["run_id"]) if run else None,
+            "runs": service.ledger.list_runs()["items"],
+            "change_sets": {
+                key: value.describe()
+                for key, value in __import__(
+                    "app.migration", fromlist=["CHANGE_SETS"]
+                ).CHANGE_SETS.items()
+            },
+        }
+
+    def create_migration(self, *, body: dict[str, Any]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, {"batch_size", "change_set_id"}, "迁移规划")
+        actor_id = current_request_context().actor_id
+        service = MigrationService(self.repository)
+        status = service.create_plan(
+            actor_id=actor_id,
+            batch_size=int(body.get("batch_size") or 20),
+            change_set_id=str(
+                body.get("change_set_id")
+                or "phenology-v2-stage-precision-scope-reference"
+            ),
+        )
+        return status
+
+    def get_migration(self, *, params: dict[str, str]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        return MigrationService(self.repository).status(params["run_id"])
+
+    def run_migration_batch(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, {"enqueue_job"}, "迁移批次")
+        actor_id = current_request_context().actor_id
+        service = MigrationService(self.repository)
+        if body.get("enqueue_job"):
+            enqueued = self.jobs.enqueue(
+                actor_id=actor_id,
+                job_type="migration_run_batch",
+                payload={"run_id": params["run_id"], "actor_id": actor_id},
+            )
+            return {"enqueued": enqueued}
+        return service.run_next_batch(actor_id=actor_id)
+
+    def stop_migration(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, set(), "停止迁移")
+        return MigrationService(self.repository).request_stop(
+            actor_id=current_request_context().actor_id,
+        )
+
+    def resume_migration(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, set(), "继续迁移")
+        return MigrationService(self.repository).resume(
+            actor_id=current_request_context().actor_id,
+        )
+
+    def rollback_migration(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, set(), "回滚迁移")
+        return MigrationService(self.repository).rollback(
+            actor_id=current_request_context().actor_id,
+        )
+
+    def complete_migration(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, set(), "完成迁移")
+        return MigrationService(self.repository).complete(
+            actor_id=current_request_context().actor_id,
+        )
+
+    def migration_incompatible(self, *, params: dict[str, str]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        return MigrationService(self.repository).incompatible_objects(params["run_id"])
+
+    def migration_failures(self, *, params: dict[str, str]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        return MigrationService(self.repository).failures(params["run_id"])
+
+    def migration_events(self, *, params: dict[str, str]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        service = MigrationService(self.repository)
+        return service.ledger.list_events(params["run_id"])
+
+    def retry_migration_batch(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, set(), "重试迁移批次")
+        return MigrationService(self.repository).retry_failed_batch(
+            batch_no=int(params["batch_no"]),
+            actor_id=current_request_context().actor_id,
+        )
+
+    def merge_migration_trees(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, {"canonical_tree_id", "member_tree_ids"}, "迁移合并")
+        member_ids = body.get("member_tree_ids") or []
+        if not isinstance(member_ids, list) or not all(
+            isinstance(item, str) for item in member_ids
+        ):
+            raise ValidationError("成员植株必须是标识数组", field_name="member_tree_ids")
+        return MigrationService(self.repository).merge_trees(
+            actor_id=current_request_context().actor_id,
+            canonical_tree_id=str(body.get("canonical_tree_id") or ""),
+            member_tree_ids=[str(item) for item in member_ids],
+        )
+
+    def record_migration_correction(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(
+            body,
+            {"kind", "object_id", "note"},
+            "迁移更正",
+        )
+        return MigrationService(self.repository).record_correction(
+            actor_id=current_request_context().actor_id,
+            kind=str(body.get("kind") or ""),
+            object_id=str(body.get("object_id") or ""),
+            note=str(body.get("note") or ""),
+        )
+
+    def revoke_migration_grant(
+        self,
+        *,
+        params: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+
+        _reject_unknown(body, {"grant_id"}, "迁移期撤销授权")
+        return MigrationService(self.repository).revoke_grant(
+            actor_id=current_request_context().actor_id,
+            grant_id=str(body.get("grant_id") or params.get("grant_id") or ""),
+        )
+
+    def migration_point_in_time(self, *, params: dict[str, str]) -> dict[str, Any]:
+        from ..migration.service import MigrationService
+        from ..migration.verifier import MigrationVerifier
+
+        service = MigrationService(self.repository)
+        run_id = params["run_id"]
+        reference_map = service.ledger.get_reference_map(run_id)
+        verifier = MigrationVerifier(self.repository.database)
+        with self.repository.database.read_connection() as connection:
+            return verifier.point_in_time_check(
+                connection,
+                kind=params["kind"],
+                object_id=params["identifier"],
+                revisions=[
+                    int(value)
+                    for value in params["revisions"].split(",")
+                    if value.strip()
+                ],
+                reference_map=reference_map,
+            )
+
 
 def build_router(handlers: ApiHandlers) -> Router:
     router = Router()
@@ -618,7 +835,138 @@ def build_router(handlers: ApiHandlers) -> Router:
         resource_kind="grant",
         resource_id_param="grant_id",
     )
+
+    _build_migration_routes(router, handlers)
     return router
+
+
+def _build_migration_routes(router: Router, handlers: ApiHandlers) -> None:
+    router.add(
+        "GET",
+        "/api/migrations",
+        handlers.migration_overview,
+        capability="migration:read",
+        resource_kind="migration",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations",
+        handlers.create_migration,
+        capability="migration:write",
+        resource_kind="migration",
+    )
+    router.add(
+        "GET",
+        "/api/migrations/{run_id}",
+        handlers.get_migration,
+        capability="migration:read",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/batches/next",
+        handlers.run_migration_batch,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/stop",
+        handlers.stop_migration,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/resume",
+        handlers.resume_migration,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/rollback",
+        handlers.rollback_migration,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/complete",
+        handlers.complete_migration,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "GET",
+        "/api/migrations/{run_id}/incompatible",
+        handlers.migration_incompatible,
+        capability="migration:read",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "GET",
+        "/api/migrations/{run_id}/failures",
+        handlers.migration_failures,
+        capability="migration:read",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "GET",
+        "/api/migrations/{run_id}/events",
+        handlers.migration_events,
+        capability="migration:read",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/batches/{batch_no}/retry",
+        handlers.retry_migration_batch,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/trees/merge",
+        handlers.merge_migration_trees,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/corrections",
+        handlers.record_migration_correction,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "PUT",
+        "/api/migrations/{run_id}/grants/revoke",
+        handlers.revoke_migration_grant,
+        capability="migration:write",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
+    router.add(
+        "GET",
+        "/api/migrations/{run_id}/point-in-time/{kind}/{identifier}/{revisions}",
+        handlers.migration_point_in_time,
+        capability="migration:read",
+        resource_kind="migration",
+        resource_id_param="run_id",
+    )
 
 
 def _optional_query(query: dict[str, list[str]], key: str) -> str | None:

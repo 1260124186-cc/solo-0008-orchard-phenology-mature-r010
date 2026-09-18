@@ -162,6 +162,96 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        3,
+        "safe dual-read domain migration ledger",
+        (
+            # 每次迁移活动：进度、批次检查点、停止/回滚决定都落在此处。
+            """
+            CREATE TABLE IF NOT EXISTS migration_runs (
+                run_id TEXT PRIMARY KEY,
+                change_set TEXT NOT NULL,
+                from_version INTEGER NOT NULL,
+                to_version INTEGER NOT NULL,
+                batch_size INTEGER NOT NULL CHECK (batch_size > 0),
+                status TEXT NOT NULL CHECK (status IN (
+                    'planning', 'shadow', 'running', 'paused',
+                    'blocked', 'completed', 'rolling_back', 'rolled_back'
+                )),
+                total_objects INTEGER NOT NULL DEFAULT 0,
+                switched_objects INTEGER NOT NULL DEFAULT 0,
+                incompatible_objects INTEGER NOT NULL DEFAULT 0,
+                retained_objects INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT,
+                stop_requested INTEGER NOT NULL DEFAULT 0,
+                rollback_requested INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                last_error TEXT
+            )
+            """,
+            # 每个对象的迁移状态：双读指纹、失败原因、不兼容集合、保留依据。
+            """
+            CREATE TABLE IF NOT EXISTS migration_objects (
+                run_id TEXT NOT NULL REFERENCES migration_runs(run_id),
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                batch_no INTEGER,
+                status TEXT NOT NULL CHECK (status IN (
+                    'pending', 'incompatible', 'ready',
+                    'switching', 'switched', 'failed', 'retained'
+                )),
+                legacy_fingerprint TEXT,
+                new_fingerprint TEXT,
+                legacy_payload TEXT CHECK (legacy_payload IS NULL OR json_valid(legacy_payload)),
+                new_payload TEXT CHECK (new_payload IS NULL OR json_valid(new_payload)),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                switched_at TEXT,
+                retained_reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, kind, object_id)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS migration_objects_run_idx
+            ON migration_objects (run_id, status, batch_no, kind, object_id)
+            """,
+            # 每批检查点：比较结果、业务指纹、血缘/审计/outbox 计数都可回溯。
+            """
+            CREATE TABLE IF NOT EXISTS migration_batches (
+                run_id TEXT NOT NULL REFERENCES migration_runs(run_id),
+                batch_no INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'planned', 'running', 'succeeded', 'failed', 'reverted'
+                )),
+                object_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint TEXT NOT NULL CHECK (json_valid(checkpoint)),
+                started_at TEXT,
+                finished_at TEXT,
+                last_error TEXT,
+                PRIMARY KEY (run_id, batch_no)
+            )
+            """,
+            # 迁移期间发生的更正、合并、授权撤销等干预动作。
+            """
+            CREATE TABLE IF NOT EXISTS migration_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES migration_runs(run_id),
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload TEXT NOT NULL CHECK (json_valid(payload)),
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS migration_events_run_idx
+            ON migration_events (run_id, id)
+            """,
+        ),
+    ),
 )
 
 
